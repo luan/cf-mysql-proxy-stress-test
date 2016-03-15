@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"runtime"
 	"sync"
+	"sync/atomic"
 
 	"github.com/Pallinder/go-randomdata"
 	_ "github.com/go-sql-driver/mysql"
@@ -17,11 +19,13 @@ import (
 
 var dbString = flag.String("db", "", "sql connection string")
 
-const (
-	dbName         = "JenLikesCats"
-	rowsToSeed     = 1000
-	maxConnections = 10
-)
+var scenario = flag.Int("scenario", 1, "which scenario to run")
+
+var maxConnections = flag.Int("maxConnections", 10, "max number of connections to the DB")
+
+var rowsToSeed = flag.Int("rowsToSeed", 1000, "number of rows to seed the database with")
+
+var dbName = flag.String("dbName", "cfMysqlStressTestDb", "database to create/drop for the test")
 
 type Cat struct {
 	Name    string
@@ -33,18 +37,20 @@ func failHandler(message string, callerSkip ...int) {
 }
 
 func main() {
+	runtime.GOMAXPROCS(runtime.NumCPU())
 	RegisterFailHandler(failHandler)
 
 	flag.Parse()
-	dropDatabase()
-	createDatabase()
+	dropDatabase(*dbName)
+	createDatabase(*dbName)
+	defer dropDatabase(*dbName)
 
-	db, err := sql.Open("mysql", *dbString+dbName)
+	db, err := sql.Open("mysql", *dbString+*dbName)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
-	db.SetMaxOpenConns(maxConnections)
+	db.SetMaxOpenConns(*maxConnections)
 
 	err = db.Ping()
 	if err != nil {
@@ -52,85 +58,84 @@ func main() {
 	}
 
 	createTable(db)
-	seedDatabase(db)
+	seedDatabase(db, *rowsToSeed)
 
-	fmt.Println("running scenario 1")
-	scenario1(db)
-	wait()
-	fmt.Println("running scenario 2")
-	scenario2(db)
-	wait()
-	fmt.Println("running scenario 3")
-	scenario3(db)
-	wait()
-}
+	initialCats := read(db)
+	totalCats := int64(len(initialCats))
 
-func wait() {
-	fmt.Print("hit ENTER when ready to continue")
+	fmt.Printf("running scenario %d\n", *scenario)
+	switch *scenario {
+	case 1:
+		dropLeader()
+	case 2:
+		reads(db, 1, &totalCats)
+	case 3:
+		writes(db, 1, &totalCats)
+	case 4:
+		reads(db, *maxConnections, &totalCats)
+	case 5:
+		writes(db, *maxConnections, &totalCats)
+	}
 
-	reader := bufio.NewReader(os.Stdin)
-	reader.ReadString('\n')
-}
-
-func scenario1(db *sql.DB) {
-	cats := read(db)
-	dropLeader()
 	finalCats := read(db)
-	compare(cats, finalCats)
+	Expect(finalCats).To(HaveLen(int(totalCats)))
 }
 
-func scenario2(db *sql.DB) {
-	initCats := read(db)
+func reads(db *sql.DB, parallelism int, totalCatsPtr *int64) {
 	stop := make(chan struct{})
-	go func() {
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-				intermediateCats := read(db)
-				compare(initCats, intermediateCats)
-			}
-		}
-	}()
-
-	dropLeader()
-	close(stop)
-	finalCats := read(db)
-	compare(initCats, finalCats)
-}
-
-func scenario3(db *sql.DB) {
-	cats := read(db)
-	stop := make(chan struct{})
-
 	wg := sync.WaitGroup{}
-	wg.Add(1)
 
-	go func() {
-		defer wg.Done()
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-				cats = append(cats, insertCat(db))
+	for i := 0; i < parallelism; i++ {
+		wg.Add(1)
+		go func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					cats := read(db)
+					totalCats := atomic.LoadInt64(totalCatsPtr)
+					Expect(cats).To(HaveLen(int(totalCats)))
+				}
 			}
-		}
-	}()
+		}()
+	}
 
 	dropLeader()
 	close(stop)
 	wg.Wait()
-	finalCats := read(db)
-	compare(cats, finalCats)
+}
+
+func writes(db *sql.DB, parallelism int, totalCatsPtr *int64) {
+	stop := make(chan struct{})
+	wg := sync.WaitGroup{}
+
+	for i := 0; i < parallelism; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					insertCat(db)
+					atomic.AddInt64(totalCatsPtr, 1)
+				}
+			}
+		}()
+	}
+
+	dropLeader()
+	close(stop)
+	wg.Wait()
 }
 
 func read(db *sql.DB) []Cat {
 	cats := []Cat{}
 	rows, err := db.Query("SELECT name, species FROM cats ORDER BY id")
 	if err != nil {
-		log.Fatal(err)
+		log.Println("failed read:", err)
 	}
 
 	for rows.Next() {
@@ -152,17 +157,9 @@ func dropLeader() {
 	reader.ReadString('\n')
 }
 
-func compare(initalCats, finalCats []Cat) {
-	Expect(finalCats).To(HaveLen(len(initalCats)))
-}
-
-func killACat(db *sql.DB) {
-	db.Exec("DELETE FROM cats ORDER BY RAND() LIMIT 1")
-}
-
-func seedDatabase(db *sql.DB) {
+func seedDatabase(db *sql.DB, numRows int) {
 	wg := sync.WaitGroup{}
-	for i := 0; i < rowsToSeed; i++ {
+	for i := 0; i < numRows; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -176,7 +173,7 @@ func insertCat(db *sql.DB) Cat {
 	cat := Cat{randomdata.SillyName(), randomdata.SillyName()}
 	_, err := db.Exec("INSERT INTO cats (name, species) VALUES (?, ?)", cat.Name, cat.Species)
 	if err != nil {
-		log.Fatal("failed to insert cat. meow.", err)
+		log.Println("failed write:", err)
 	}
 	return cat
 }
@@ -188,7 +185,7 @@ func createTable(db *sql.DB) {
 	}
 }
 
-func createDatabase() {
+func createDatabase(dbName string) {
 	db, err := sql.Open("mysql", *dbString)
 	if err != nil {
 		log.Fatal(err)
@@ -201,14 +198,14 @@ func createDatabase() {
 	}
 }
 
-func dropDatabase() {
+func dropDatabase(dbName string) {
 	db, err := sql.Open("mysql", *dbString)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
 
-	_, err = db.Exec("DROP DATABASE " + dbName)
+	_, err = db.Exec("DROP DATABASE IF EXISTS " + dbName)
 	if err != nil {
 		log.Fatal(err)
 	}
