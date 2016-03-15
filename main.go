@@ -88,6 +88,7 @@ func reads(db *sql.DB, parallelism int, totalCatsPtr *int64) {
 	for i := 0; i < parallelism; i++ {
 		wg.Add(1)
 		go func() {
+			defer wg.Done()
 			for {
 				select {
 				case <-stop:
