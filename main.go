@@ -33,7 +33,7 @@ type Cat struct {
 }
 
 func failHandler(message string, callerSkip ...int) {
-	log.Fatal(message)
+	log.Println(message)
 }
 
 func main() {
@@ -75,10 +75,22 @@ func main() {
 		reads(db, *maxConnections, &totalCats)
 	case 5:
 		writes(db, *maxConnections, &totalCats)
+	case 6:
+		wg := sync.WaitGroup{}
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			reads(db, *maxConnections, &totalCats)
+		}()
+		go func() {
+			defer wg.Done()
+			writes(db, *maxConnections, &totalCats)
+		}()
+		wg.Wait()
 	}
 
 	finalCats := read(db)
-	Expect(finalCats).To(HaveLen(int(totalCats)))
+	Expect(len(finalCats)).To(Equal(int(totalCats)))
 }
 
 func reads(db *sql.DB, parallelism int, totalCatsPtr *int64) {
@@ -137,6 +149,7 @@ func read(db *sql.DB) []Cat {
 	rows, err := db.Query("SELECT name, species FROM cats ORDER BY id")
 	if err != nil {
 		log.Println("failed read:", err)
+		return cats
 	}
 
 	for rows.Next() {
